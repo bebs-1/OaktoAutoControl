@@ -8,15 +8,20 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(rclpy REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(sensor_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
 
 # Build C++ node
-add_executable(motor_driver src/motor_driver.cpp)
+add_executable(motor_driver 
+  src/motor_driver.cpp
+  src/SparkBase.cpp
+  src/SparkMax.cpp
+)
 target_include_directories(motor_driver PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-ament_target_dependencies(motor_driver rclcpp std_msgs)
+ament_target_dependencies(motor_driver rclcpp std_msgs sensor_msgs)
 
 # Install the C++ executable
 install(TARGETS motor_driver
@@ -26,9 +31,14 @@ install(TARGETS motor_driver
 install(DIRECTORY include/
   DESTINATION include)
 
-# Install Python script as an executable
+# Install Python scripts as executables
 install(PROGRAMS
-  scripts/command_sender.py
+  scripts/ros2_controller.py
+  scripts/costmap.py
+  scripts/lidar_processing.py
+  scripts/mapping.py
+  scripts/odometry.py
+  scripts/pathfinding.py
   DESTINATION lib/${PROJECT_NAME})
 
 # Install launch files
@@ -49,6 +59,6 @@ endif()
 
 # Export include directories and dependencies
 ament_export_include_directories(include)
-ament_export_dependencies(rclcpp std_msgs)
+ament_export_dependencies(rclcpp std_msgs sensor_msgs)
 
 ament_package()
