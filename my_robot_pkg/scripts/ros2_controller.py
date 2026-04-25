@@ -106,6 +106,11 @@ class RobotController(Node):
         # Default 7 = Start button on most Linux Xbox mappings.
         self.declare_parameter('auto_toggle_button', 7)
 
+        # LiDAR mounting orientation
+        # lidar_upside_down=True → sensor is mounted inverted (180° around X/forward axis).
+        # Applies y → -y, z → -z so obstacle heights and lateral positions are correct.
+        self.declare_parameter('lidar_upside_down', False)
+
         # Depth-camera options
         # depth_optical_frame=True  → cloud arrives in the RealSense optical
         #   frame (Z-forward, X-right, Y-down).  The node rotates it to the
@@ -164,6 +169,7 @@ class RobotController(Node):
         motor_data_t      = p('motor_data_topic').value
         self._auto_btn    = int(p('auto_toggle_button').value)
 
+        self._lidar_upside_down = bool(p('lidar_upside_down').value)
         self._depth_optical    = p('depth_optical_frame').value
         self._depth_cam_height = p('depth_cam_height').value
         self._depth_max_pts    = int(p('depth_max_points').value)
@@ -261,6 +267,9 @@ class RobotController(Node):
         # IDLE | NAV_TO_DIG | DIGGING | NAV_TO_DUMP | DUMPING
         self._mission_state: str = 'IDLE'
         self._step = 0
+        # When the mission is paused by Start, this stores the phase to enter
+        # on the next Start press so manual driving can bridge a travel leg.
+        self._resume_phase: str | None = None
 
         # ── Module initialisation ─────────────────────────────────────
         odometry.setup(encoders_ok=True, imu_ok=True,
@@ -304,6 +313,10 @@ class RobotController(Node):
             dtype=np.float32,
         )
         if pts.ndim == 2 and pts.shape[0] > 0:
+            if self._lidar_upside_down:
+                # 180° rotation around X (forward): y → -y, z → -z
+                pts[:, 1] = -pts[:, 1]
+                pts[:, 2] = -pts[:, 2]
             self._latest_lidar = pts
 
     def _depth_cb(self, msg: PointCloud2) -> None:
@@ -416,18 +429,38 @@ class RobotController(Node):
 
         if curr_val == 1 and prev_val == 0:
             if self._mission_state == 'IDLE':
-                self._mission_state = 'NAV_TO_DIG'
-                self._navigate_to(self._dig_x, self._dig_y)
-                self.get_logger().info(
-                    f'Mission STARTED → navigating to dig site '
-                    f'({self._dig_x:.2f}, {self._dig_y:.2f})')
+                if self._resume_phase is not None:
+                    # Resume at the phase saved when the mission was paused
+                    phase = self._resume_phase
+                    self._resume_phase = None
+                    self._start_phase(phase)
+                else:
+                    # Fresh start from the beginning
+                    self._mission_state = 'NAV_TO_DIG'
+                    self._navigate_to(self._dig_x, self._dig_y)
+                    self.get_logger().info(
+                        f'Mission STARTED → navigating to dig site '
+                        f'({self._dig_x:.2f}, {self._dig_y:.2f})')
             else:
+                # Pause: record what phase should start on the next press,
+                # then hand control back to the driver.
+                _NEXT = {
+                    'NAV_TO_DIG':  'DIGGING',
+                    'DIGGING':     'NAV_TO_DUMP',
+                    'NAV_TO_DUMP': 'DUMPING',
+                    'DUMPING':     'NAV_TO_DIG',
+                }
+                self._resume_phase  = _NEXT.get(self._mission_state, 'NAV_TO_DIG')
                 self._mission_state = 'IDLE'
                 self._teleop_rpm    = None
                 self._auto_digging  = False
                 self._dig_state     = 'IDLE'
+                self._serial_cmd('stop', channel=1)
+                self._serial_cmd('stop', channel=2)
                 self._stop_motors()
-                self.get_logger().info('Mission ABORTED — manual control')
+                self.get_logger().info(
+                    f'Mission PAUSED — manual control active. '
+                    f'Press Start to begin {self._resume_phase}.')
 
         self._prev_joy_buttons = buttons
 
@@ -468,6 +501,7 @@ class RobotController(Node):
             if self._dig_state not in ('IDLE', 'HOLD'):
                 self._dig_state     = 'IDLE'
                 self._mission_state = 'IDLE'
+                self._resume_phase  = None   # D-pad full abort — clear any saved resume
                 self.get_logger().info('[SEQ] Sequence cancelled by D-pad — mission aborted')
             self._auto_digging = False
             self._serial_cmd('u1', channel=1)
@@ -475,6 +509,7 @@ class RobotController(Node):
             if self._dig_state not in ('IDLE', 'HOLD'):
                 self._dig_state     = 'IDLE'
                 self._mission_state = 'IDLE'
+                self._resume_phase  = None   # D-pad full abort — clear any saved resume
                 self.get_logger().info('[SEQ] Sequence cancelled by D-pad — mission aborted')
             self._auto_digging = False
             self._serial_cmd('d1', channel=1)
@@ -496,6 +531,33 @@ class RobotController(Node):
             self._serial_cmd('stop', channel=2)
 
     # ── Navigation service ────────────────────────────────────────────────
+
+    def _start_phase(self, phase: str) -> None:
+        """Enter a specific mission phase directly (used after a manual pause)."""
+        if phase == 'DIGGING':
+            self._mission_state   = 'DIGGING'
+            self._dig_state       = 'OPEN_BUCKET'
+            self._auto_digging    = True
+            self._dig_phase_start = self.get_clock().now().nanoseconds * 1e-9
+            self.get_logger().info('[RESUME] Starting dig sequence at current position')
+        elif phase == 'NAV_TO_DUMP':
+            self._mission_state = 'NAV_TO_DUMP'
+            self._navigate_to(self._dump_x, self._dump_y)
+            self.get_logger().info(
+                f'[RESUME] Navigating to dump site '
+                f'({self._dump_x:.2f}, {self._dump_y:.2f})')
+        elif phase == 'DUMPING':
+            self._mission_state   = 'DUMPING'
+            self._dig_state       = 'DUMP_LOWER_ARM'
+            self._auto_digging    = True
+            self._dig_phase_start = self.get_clock().now().nanoseconds * 1e-9
+            self.get_logger().info('[RESUME] Starting dump sequence at current position')
+        elif phase == 'NAV_TO_DIG':
+            self._mission_state = 'NAV_TO_DIG'
+            self._navigate_to(self._dig_x, self._dig_y)
+            self.get_logger().info(
+                f'[RESUME] Navigating to dig site '
+                f'({self._dig_x:.2f}, {self._dig_y:.2f})')
 
     def _start_nav_cb(self, _request, response):
         if self._mission_state == 'IDLE':
@@ -751,6 +813,7 @@ class RobotController(Node):
         Int32MultiArray layout (matches MotorDriver.cpp ordering):
           [0] motor1 = FL,  [1] motor2 = FR
           [2] motor3 = RL,  [3] motor4 = RR
+          add gear ratio and convert from rad/s to RPM: RPM = rad/s × 60 / (2π) × gear_ratio
         """
         fl = int(round(left  * _RAD_S_TO_RPM))
         fr = int(round(right * _RAD_S_TO_RPM))
