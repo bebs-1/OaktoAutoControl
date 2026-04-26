@@ -281,10 +281,12 @@ class RobotController(Node):
 
         # ── Control timer ─────────────────────────────────────────────
         self._timer = self.create_timer(self.dt, self._control_loop)
-        # ── Serial position read timer (20 Hz) ───────────────────────────
+        # ── Serial position read timer (100 Hz) ──────────────────────────
         # Drains the Arduino's "pos1,pos2\n" stream without blocking the
         # control loop.  Uses in_waiting so it only reads when data is ready.
-        self._serial_timer = self.create_timer(0.05, self._read_serial_positions)
+        # 100 Hz keeps pace with fast Arduino loops and prevents the OS
+        # serial buffer (4096 bytes) from filling and dropping position data.
+        self._serial_timer = self.create_timer(0.01, self._read_serial_positions)
         self.get_logger().info(
             f'robot_controller ready | '
             f'start=({start_x}, {start_y})  goal=({goal_x}, {goal_y})')
