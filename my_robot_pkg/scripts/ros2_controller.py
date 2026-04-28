@@ -121,12 +121,15 @@ class RobotController(Node):
         self.declare_parameter('depth_max_points',    5000)   # subsample cap
 
         # Serial port for mechanism control (D-pad) and auto-digging
-        self.declare_parameter('serial_port', '/dev/ttyUSB0')
+        self.declare_parameter('serial_port', '/dev/ttyACM0')
         self.declare_parameter('serial_baud', 9600)
 
         # Joy axes / drive parameters
         self.declare_parameter('drive_rpm',   500)    # RPM used for manual driving
         self.declare_parameter('joy_deadband', 0.2)
+        self.declare_parameter('actuator_debug', True)
+        self.declare_parameter('actuator_resend_sec', 0.2)
+        self.declare_parameter('dpad_release_grace_sec', 0.18)
 
         # Auto-dig sequence target positions (inches, relative to Arduino startup pos=0)
         # Tune these to match your robot's physical geometry.
@@ -176,6 +179,9 @@ class RobotController(Node):
         self.dt                = 1.0 / ctrl_hz
         self._drive_rpm        = int(p('drive_rpm').value)
         self._joy_deadband     = float(p('joy_deadband').value)
+        self._actuator_debug   = bool(p('actuator_debug').value)
+        self._actuator_resend_sec = float(p('actuator_resend_sec').value)
+        self._dpad_release_grace_sec = float(p('dpad_release_grace_sec').value)
         self._dig_arm_lower    = float(p('dig_arm_lower_pos').value)
         self._dig_bucket_open  = float(p('dig_bucket_open_pos').value)
         self._dig_arm_carry    = float(p('dig_arm_carry_pos').value)
@@ -195,6 +201,8 @@ class RobotController(Node):
 
         # ── Serial port (mechanisms + auto-dig) ─────────────────
         self._ser: 'serial.Serial | None' = None
+        self._serial_open_time: float = 0.0
+        self._last_pos_rx_time: float = 0.0
         if _SERIAL_AVAILABLE:
             try:
                 self._ser = serial.Serial(
@@ -202,6 +210,9 @@ class RobotController(Node):
                     p('serial_baud').value,
                     timeout=0.1,
                 )
+                now_s = self.get_clock().now().nanoseconds * 1e-9
+                self._serial_open_time = now_s
+                self._last_pos_rx_time = now_s
                 self.get_logger().info(
                     f'Serial port opened: {p("serial_port").value}')
             except Exception as e:
@@ -249,6 +260,11 @@ class RobotController(Node):
         # Mechanism serial state (deduplicated — only write on change)
         self._mech1_state: str = ''
         self._mech2_state: str = ''
+        self._mech1_last_tx: float = 0.0
+        self._mech2_last_tx: float = 0.0
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        self._act1_last_active: float = now_s
+        self._act2_last_active: float = now_s
 
         # Actuator positions fed back from Arduino serial (inches, relative to startup=0)
         self._act1_pos: float = 0.0
@@ -399,6 +415,12 @@ class RobotController(Node):
                     if len(parts) == 2:
                         self._act1_pos = float(parts[0])
                         self._act2_pos = float(parts[1])
+                        self._last_pos_rx_time = self.get_clock().now().nanoseconds * 1e-9
+                        if self._actuator_debug:
+                            self.get_logger().info(
+                                f'[ACT POS] a1={self._act1_pos:.3f} a2={self._act2_pos:.3f}',
+                                throttle_duration_sec=0.5,
+                            )
         except Exception as exc:
             self.get_logger().warn(
                 f'Serial read error: {exc}', throttle_duration_sec=5.0)
@@ -491,46 +513,66 @@ class RobotController(Node):
             self._teleop_override = moving
 
         # ── Mechanism control via D-pad (serial) ────────────────────────
-        # D-pad left/right (axes[6]): actuator 1  — u1 = up, d1 = down
-        # D-pad up/down   (axes[7]): actuator 2  — u2 = up, d2 = down
-        # Neutral D-pad only sends 'stop' when no auto-dig is holding the channel.
-        act1 = axes[6] if len(axes) > 6 else 0.0
-        act2 = axes[7] if len(axes) > 7 else 0.0
+        # D-pad up/down   (axes[7]): actuator 1  — u1 = up, d1 = down
+        # D-pad left/right (axes[6]): actuator 2  — u2 = up, d2 = down
+        act1 = axes[7] if len(axes) > 7 else 0.0
+        act2 = axes[6] if len(axes) > 6 else 0.0
+        now_s = self.get_clock().now().nanoseconds * 1e-9
+        if self._actuator_debug:
+            self.get_logger().info(
+                f'[ACT JOY] dpad_y={act1:+.2f} dpad_x={act2:+.2f} state={self._dig_state}',
+                throttle_duration_sec=0.25,
+            )
 
         # Actuator 1 (arm / lift)
-        # Any active D-pad press cancels an in-progress sequence AND aborts the mission.
+        cmd1 = None
         if act1 > DEAD:
+            self._act1_last_active = now_s
             if self._dig_state not in ('IDLE', 'HOLD'):
                 self._dig_state     = 'IDLE'
                 self._mission_state = 'IDLE'
-                self._resume_phase  = None   # D-pad full abort — clear any saved resume
+                self._resume_phase  = None
                 self.get_logger().info('[SEQ] Sequence cancelled by D-pad — mission aborted')
             self._auto_digging = False
-            self._serial_cmd('u1', channel=1)
+            cmd1 = 'u1'
         elif act1 < -DEAD:
+            self._act1_last_active = now_s
             if self._dig_state not in ('IDLE', 'HOLD'):
                 self._dig_state     = 'IDLE'
                 self._mission_state = 'IDLE'
-                self._resume_phase  = None   # D-pad full abort — clear any saved resume
+                self._resume_phase  = None
                 self.get_logger().info('[SEQ] Sequence cancelled by D-pad — mission aborted')
             self._auto_digging = False
-            self._serial_cmd('d1', channel=1)
-        elif self._dig_state == 'IDLE':       # neutral — stop only when no sequence running
-            self._serial_cmd('stop', channel=1)
+            cmd1 = 'd1'
+        elif (now_s - self._act1_last_active) > self._dpad_release_grace_sec:
+            cmd1 = 'stop'
 
         # Actuator 2 (bucket / tilt)
+        cmd2 = None
         if act2 > DEAD:
+            self._act2_last_active = now_s
             if self._dig_state not in ('IDLE', 'HOLD'):
                 self._dig_state     = 'IDLE'
                 self._mission_state = 'IDLE'
-            self._serial_cmd('u2', channel=2)
+            cmd2 = 'u2'
         elif act2 < -DEAD:
+            self._act2_last_active = now_s
             if self._dig_state not in ('IDLE', 'HOLD'):
                 self._dig_state     = 'IDLE'
                 self._mission_state = 'IDLE'
-            self._serial_cmd('d2', channel=2)
-        elif self._dig_state == 'IDLE':       # neutral — stop only when no sequence running
-            self._serial_cmd('stop', channel=2)
+            cmd2 = 'd2'
+        elif (now_s - self._act2_last_active) > self._dpad_release_grace_sec:
+            cmd2 = 'stop'
+
+        if cmd1 in ('u1', 'd1'):
+            self._serial_cmd(cmd1, channel=1)
+        elif cmd1 == 'stop' and self._dig_state == 'IDLE':
+            self._serial_cmd('stop1', channel=1)
+
+        if cmd2 in ('u2', 'd2'):
+            self._serial_cmd(cmd2, channel=2)
+        elif cmd2 == 'stop' and self._dig_state == 'IDLE':
+            self._serial_cmd('stop2', channel=2)
 
     # ── Navigation service ────────────────────────────────────────────────
 
@@ -715,6 +757,17 @@ class RobotController(Node):
     def _control_loop(self) -> None:
         self._step += 1
 
+        # Warn if serial is open but no actuator position feedback has arrived.
+        if self._ser is not None and self._ser.is_open:
+            now_s = self.get_clock().now().nanoseconds * 1e-9
+            if (now_s - self._last_pos_rx_time) > 5.0:
+                self.get_logger().warn(
+                    'No actuator position feedback received for >5s. '
+                    'If Arduino firmware has startup delay, wait for it to finish; '
+                    'otherwise verify serial port/baud and Arduino serial output format "pos1,pos2".',
+                    throttle_duration_sec=5.0,
+                )
+
         # Odometry: requires both IMU yaw and all four wheel encoder values
         if (self._imu_ready and
                 all(v is not None for v in self._wheel_pos.values())):
@@ -831,19 +884,29 @@ class RobotController(Node):
 
     def _serial_cmd(self, cmd: str, channel: int) -> None:
         """Write a mechanism command to the serial port, but only if the
-        state for that channel has changed (avoids flooding the serial bus)."""
+        state for that channel has changed.
+
+        To improve robustness on noisy/reset-prone serial links, unchanged
+        commands are periodically re-sent at actuator_resend_sec intervals.
+        """
         if self._ser is None:
             return
+        now_s = self.get_clock().now().nanoseconds * 1e-9
         if channel == 1:
-            if cmd == self._mech1_state:
+            if cmd == self._mech1_state and (now_s - self._mech1_last_tx) < self._actuator_resend_sec:
                 return
             self._mech1_state = cmd
+            self._mech1_last_tx = now_s
         else:
-            if cmd == self._mech2_state:
+            if cmd == self._mech2_state and (now_s - self._mech2_last_tx) < self._actuator_resend_sec:
                 return
             self._mech2_state = cmd
+            self._mech2_last_tx = now_s
         try:
-            self._ser.write(cmd.encode())
+            # Arduino side uses readStringUntil('\n'), so delimit each command.
+            self._ser.write((cmd + '\n').encode('ascii'))
+            if self._actuator_debug:
+                self.get_logger().info(f'[ACT TX] ch{channel} -> {cmd}')
         except Exception as e:
             self.get_logger().warn(f'Serial write error: {e}')
 
@@ -861,7 +924,7 @@ def main(args=None) -> None:
     finally:
         node._stop_motors()
         if node._ser is not None and node._ser.is_open:
-            node._ser.write(b'stop')
+            node._ser.write(b'stop\n')
             node._ser.close()
         node.destroy_node()
         rclpy.shutdown()
