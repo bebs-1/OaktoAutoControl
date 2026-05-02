@@ -88,15 +88,15 @@ class RobotController(Node):
         super().__init__('robot_controller')
 
         # ── ROS parameters ────────────────────────────────────────────
-        self.declare_parameter('start_x',    0.6)
-        self.declare_parameter('start_y',    0.8)
-        self.declare_parameter('goal_x',     6.0)
-        self.declare_parameter('goal_y',     0.5)
+        self.declare_parameter('start_x',    0.0)
+        self.declare_parameter('start_y',    0.0)
+        self.declare_parameter('goal_x',     0.0)
+        self.declare_parameter('goal_y',     0.0)
         self.declare_parameter('control_hz', 31.25)   # ≈ 32 ms timestep
-
+        self.declare_parameter(('joytimeout_sec'), 0.5)  # how long to wait after the last /joy message before stopping tele-op commands
         # Topic names
         self.declare_parameter('lidar_topic',   '/livox/lidar')
-        self.declare_parameter('depth_topic',   '/camera/depth/color/points')
+        self.declare_parameter('depth_topic',   '/camera/camera/depth/color/points')
         self.declare_parameter('imu_topic',     '/camera/imu')
         self.declare_parameter('cmd_vel_topic',        '/cmd_vel')
         self.declare_parameter('joy_topic',             '/joy')
@@ -125,9 +125,9 @@ class RobotController(Node):
         self.declare_parameter('serial_baud', 9600)
 
         # Joy axes / drive parameters
-        self.declare_parameter('drive_rpm',   500)    # RPM used for manual driving
+        self.declare_parameter('drive_rpm',   1500)    # RPM used for manual driving
         self.declare_parameter('joy_deadband', 0.2)
-        self.declare_parameter('actuator_debug', True)
+        self.declare_parameter('actuator_debug', False)
         self.declare_parameter('actuator_resend_sec', 0.2)
         self.declare_parameter('dpad_release_grace_sec', 0.18)
 
@@ -149,8 +149,8 @@ class RobotController(Node):
         self.declare_parameter('dig_phase_timeout', 15.0)
 
         # Dump site coordinates (default = start position; set to your bin location)
-        self.declare_parameter('dump_x', 0.6)
-        self.declare_parameter('dump_y', 0.8)
+        self.declare_parameter('dump_x', 0.0)
+        self.declare_parameter('dump_y', 0.0)
         # Dump sequence actuator positions (inches, same origin as dig positions)
         self.declare_parameter('dump_arm_pos',            1.0)   # arm height over dump bin
         self.declare_parameter('dump_bucket_release_pos',  5.0)  # tilt bucket forward to drop load
@@ -171,6 +171,8 @@ class RobotController(Node):
         motor_cmd_t       = p('motor_cmd_topic').value
         motor_data_t      = p('motor_data_topic').value
         self._auto_btn    = int(p('auto_toggle_button').value)
+        self.last_joy_time = self.get_clock().now()
+        self._joy_timeout_sec = float(p('joytimeout_sec').value)
 
         self._lidar_upside_down = bool(p('lidar_upside_down').value)
         self._depth_optical    = p('depth_optical_frame').value
@@ -303,6 +305,7 @@ class RobotController(Node):
         # 100 Hz keeps pace with fast Arduino loops and prevents the OS
         # serial buffer (4096 bytes) from filling and dropping position data.
         self._serial_timer = self.create_timer(0.01, self._read_serial_positions)
+        self._watchdog_timer = self.create_timer(0.01, self.joy_watchdog)
         self.get_logger().info(
             f'robot_controller ready | '
             f'start=({start_x}, {start_y})  goal=({goal_x}, {goal_y})')
@@ -432,8 +435,8 @@ class RobotController(Node):
         ----
           axes[1]  Left stick Y   → forward / backward
           axes[0]  Left stick X   → turn left / right
-          axes[6]  D-pad X        → mechanism 1  (serial: u1 / d1 / stop)
-          axes[7]  D-pad Y        → mechanism 2  (serial: u2 / d2 / stop)
+          axes[4]  Right stick Y  → mechanism 1  (serial: u1 / d1 / stop)
+          axes[6]  D-pad X        → mechanism 2  (serial: u2 / d2 / stop)
 
         Buttons
         -------
@@ -442,13 +445,15 @@ class RobotController(Node):
         """
         buttons = list(msg.buttons)
         axes    = list(msg.axes)
+        self.last_joy_time = self.get_clock().now()
+        prev_buttons = self._prev_joy_buttons
 
         DEAD = self._joy_deadband
         RPM  = self._drive_rpm
-
+        DRPM = self._dig_drive_rpm
         # ── Autonomous toggle (rising-edge on Start button) ────────────
-        prev_val = (self._prev_joy_buttons[self._auto_btn]
-                    if self._auto_btn < len(self._prev_joy_buttons) else 0)
+        prev_val = (prev_buttons[self._auto_btn]
+                if self._auto_btn < len(prev_buttons) else 0)
         curr_val = buttons[self._auto_btn] if self._auto_btn < len(buttons) else 0
 
         if curr_val == 1 and prev_val == 0:
@@ -486,11 +491,17 @@ class RobotController(Node):
                     f'Mission PAUSED — manual control active. '
                     f'Press Start to begin {self._resume_phase}.')
 
-        self._prev_joy_buttons = buttons
-
         # ── Driving axes (only active when not in autonomous mode) ──────
         fwd  = axes[1] if len(axes) > 1 else 0.0
+        digfwd = buttons[5] if len(buttons) > 5 else 0  # Right bumper for dig-assist drive
+        set_btn = buttons[2] if len(buttons) > 2 else 0  # X button sends actuator position set command
+        prev_set_btn = prev_buttons[2] if len(prev_buttons) > 2 else 0
         turn = axes[0] if len(axes) > 0 else 0.0
+
+        # Send one-shot position set command on X button rising edge.
+        if set_btn == 1 and prev_set_btn == 0:
+            self._serial_cmd('set', channel=1)
+            self.get_logger().info('[ACT] Sent set command to Arduino')
 
         if self._mission_state == 'IDLE':
             if abs(fwd) > abs(turn):
@@ -500,22 +511,24 @@ class RobotController(Node):
                     self._teleop_rpm = [-RPM, -RPM, -RPM, -RPM]   # backward
                 else:
                     self._teleop_rpm = [0, 0, 0, 0]
+            elif digfwd == 1:
+                self._teleop_rpm = [ DRPM,  DRPM,  DRPM,  DRPM]   # dig-assist forward
             else:
                 if turn > DEAD:
-                    self._teleop_rpm = [ RPM,  RPM, -RPM, -RPM]   # left
+                    self._teleop_rpm = [ -RPM,  RPM, -RPM, RPM]   # left
                 elif turn < -DEAD:
-                    self._teleop_rpm = [-RPM, -RPM,  RPM,  RPM]   # right
+                    self._teleop_rpm = [RPM, -RPM, RPM, -RPM]   # right
                 else:
                     self._teleop_rpm = [0, 0, 0, 0]
 
-            moving = self._teleop_rpm is not None and any(
-                v != 0 for v in self._teleop_rpm)
-            self._teleop_override = moving
+            # Always override (including when RPM=[0,0,0,0]) so the
+            # zero-stop command is actually published when sticks are released.
+            self._teleop_override = True
 
         # ── Mechanism control via D-pad (serial) ────────────────────────
         # D-pad up/down   (axes[7]): actuator 1  — u1 = up, d1 = down
         # D-pad left/right (axes[6]): actuator 2  — u2 = up, d2 = down
-        act1 = axes[7] if len(axes) > 7 else 0.0
+        act1 = axes[4] if len(axes) > 4 else 0.0
         act2 = axes[6] if len(axes) > 6 else 0.0
         now_s = self.get_clock().now().nanoseconds * 1e-9
         if self._actuator_debug:
@@ -574,8 +587,20 @@ class RobotController(Node):
         elif cmd2 == 'stop' and self._dig_state == 'IDLE':
             self._serial_cmd('stop2', channel=2)
 
-    # ── Navigation service ────────────────────────────────────────────────
+        self._prev_joy_buttons = buttons
 
+  
+    def joy_watchdog(self) -> None:
+        """If we haven't received a /joy message in a while, stop tele-op commands."""
+        if self._teleop_override:
+            elapsed_sec = (self.get_clock().now() - self.last_joy_time).nanoseconds * 1e-9
+            if elapsed_sec > self._joy_timeout_sec:
+                self._teleop_override = False
+                self._teleop_rpm = None
+                self.get_logger().info(
+                    f'Joy timeout: no messages received for {elapsed_sec:.1f} seconds. '
+                    'Tele-op commands cancelled.')
+  # ── Navigation service ────────────────────────────────────────────────
     def _start_phase(self, phase: str) -> None:
         """Enter a specific mission phase directly (used after a manual pause)."""
         if phase == 'DIGGING':
@@ -662,7 +687,7 @@ class RobotController(Node):
         if self._dig_state == 'OPEN_BUCKET':
             self._serial_cmd('u2', channel=2)
             if self._act2_pos >= self._dig_bucket_open - TOL:
-                self._serial_cmd('stop', channel=2)   # hold bucket open
+                self._serial_cmd('stop2', channel=2)   # hold bucket open
                 self._dig_state = 'LOWER_ARM'
                 self._dig_phase_start = self.get_clock().now().nanoseconds * 1e-9
                 self.get_logger().info(
@@ -682,8 +707,10 @@ class RobotController(Node):
 
         elif self._dig_state == 'CURL_BUCKET':
             self._serial_cmd('d2', channel=2)
+            self._serial_cmd('d1', channel=1)   # keep lowering slightly while curling for better scoop
             if self._act2_pos <= self._dig_bucket_hold + TOL:
-                self._serial_cmd('stop', channel=2)
+                self._serial_cmd('stop2', channel=2)
+                self._serial_cmd('stop1', channel=1)
                 self._dig_state = 'RAISE_ARM'
                 self._dig_phase_start = self.get_clock().now().nanoseconds * 1e-9
                 self.get_logger().info(
@@ -694,8 +721,8 @@ class RobotController(Node):
         elif self._dig_state == 'RAISE_ARM':
             self._serial_cmd('u1', channel=1)
             if self._act1_pos >= self._dig_arm_carry - TOL:
-                self._serial_cmd('stop', channel=1)
-                self._serial_cmd('stop', channel=2)
+                self._serial_cmd('stop1', channel=1)
+                self._serial_cmd('stop2', channel=2)
                 self._dig_state    = 'HOLD'
                 self._auto_digging = False
                 self.get_logger().info(
@@ -708,7 +735,7 @@ class RobotController(Node):
             cmd = 'u1' if self._dump_arm_pos > self._act1_pos else 'd1'
             self._serial_cmd(cmd, channel=1)
             if abs(self._act1_pos - self._dump_arm_pos) <= TOL:
-                self._serial_cmd('stop', channel=1)
+                self._serial_cmd('stop1', channel=1)
                 self._dig_state = 'DUMP_RELEASE'
                 self._dig_phase_start = self.get_clock().now().nanoseconds * 1e-9
                 self.get_logger().info(
@@ -718,7 +745,7 @@ class RobotController(Node):
         elif self._dig_state == 'DUMP_RELEASE':
             self._serial_cmd('u2', channel=2)
             if self._act2_pos >= self._dump_bucket_release - TOL:
-                self._serial_cmd('stop', channel=2)
+                self._serial_cmd('stop2', channel=2)
                 self._dig_state = 'DUMP_RESET_ARM'
                 self._dig_phase_start = self.get_clock().now().nanoseconds * 1e-9
                 self.get_logger().info(
@@ -876,11 +903,13 @@ class RobotController(Node):
         rr = int(round(right * _RAD_S_TO_RPM))
         self._publish_rpm(fl, fr, rl, rr)
 
+
     def _publish_rpm(self, fl: int, fr: int, rl: int, rr: int) -> None:
         """Publish four individual wheel RPM values directly to motor_cmd."""
         msg = Int32MultiArray()
-        msg.data = [fl, fr, rl, rr]
+        msg.data = [fl, rl, fr, rr]
         self._motor_cmd_pub.publish(msg)
+        self.get_logger().debug(f'Publishing RPM cmd: FL={fl} FR={fr} RL={rl} RR={rr}')
 
     def _serial_cmd(self, cmd: str, channel: int) -> None:
         """Write a mechanism command to the serial port, but only if the
